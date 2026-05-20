@@ -305,7 +305,14 @@ app.get('/ws', { websocket: true }, (connection) => {
     })
   )
 
-  socket.close(1000)
+  
+  // IMPORTANT:
+  // delay close so Render proxy finishes upgrade properly
+  setTimeout(() => {
+    try {
+      socket.close()
+    } catch {}
+  }, 1000)
 })
 
 // ─────────────────────────────────────────────────────────────
