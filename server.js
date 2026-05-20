@@ -204,17 +204,18 @@ await app.register(websocket, {
 app.get('/health', { config: { rateLimit: { max: 30, timeWindow: '1 minute' } } },
   async () => ({ ok: true })
 )
-app.get('/ws', { websocket: true }, (socket) => {
-  socket.send(JSON.stringify({
+app.get('/ws', { websocket: true }, (connection) => {
+  app.log.info('WS health connected')
+
+  connection.socket.send(JSON.stringify({
     event: 'health',
     data: {
       ok: true,
-      service: 'FluxShare WebSocket',
       timestamp: Date.now(),
     },
   }))
 
-  socket.close(1000, 'OK')
+  connection.socket.close(1000)
 })
 // POST /api/sessions
 app.post('/api/sessions', {
