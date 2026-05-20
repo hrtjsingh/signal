@@ -290,27 +290,20 @@ app.get('/health', async () => {
   }
 })
 
-app.get('/ws', { websocket: true }, (connection) => {
-  const socket = connection.socket
-
+app.get('/ws', { websocket: true }, (socket, req) => {
   app.log.info('WS health connected')
 
-  socket.send(
-    JSON.stringify({
-      event: 'health',
-      data: {
-        ok: true,
-        timestamp: Date.now(),
-      },
-    })
-  )
+  socket.send(JSON.stringify({
+    event: 'health',
+    data: {
+      ok: true,
+      timestamp: Date.now(),
+    },
+  }))
 
-  
-  // IMPORTANT:
-  // delay close so Render proxy finishes upgrade properly
   setTimeout(() => {
     try {
-      socket.close()
+      socket.close(1000, 'OK')
     } catch {}
   }, 1000)
 })
@@ -415,9 +408,7 @@ app.delete('/api/sessions/:id', async (req, reply) => {
 app.get(
   '/ws/sessions/:id',
   { websocket: true },
-  (connection, req) => {
-    const socket = connection.socket
-
+  (socket, req) => {
     const { id } = req.params
 
     app.log.info(`WS session connect ${id}`)
@@ -430,12 +421,12 @@ app.get(
         },
       }))
 
-      socket.close(1013)
+      socket.close(1013, 'Server at capacity')
       return
     }
 
     if (!/^[a-zA-Z0-9]{6,16}$/.test(id)) {
-      socket.close(1008)
+      socket.close(1008, 'Invalid session ID')
       return
     }
 
@@ -449,7 +440,7 @@ app.get(
         },
       }))
 
-      socket.close(1008)
+      socket.close(1008, 'Session not found')
       return
     }
 
@@ -467,7 +458,7 @@ app.get(
         },
       }))
 
-      socket.close(1008)
+      socket.close(1008, 'Subscriber cap reached')
       return
     }
 
@@ -486,16 +477,16 @@ app.get(
 
     const heartbeat = setInterval(() => {
       try {
-        socket.ping()
+        if (socket.readyState === 1) {
+          socket.ping()
+        }
       } catch {}
     }, 30000)
 
     let cleaned = false
 
     const cleanup = () => {
-      if (cleaned) {
-        return
-      }
+      if (cleaned) return
 
       cleaned = true
 
@@ -526,7 +517,10 @@ app.get(
         if (
           msg.event === 'progress' &&
           typeof msg.progress === 'number' &&
-          typeof msg.speed === 'number'
+          msg.progress >= 0 &&
+          msg.progress <= 100 &&
+          typeof msg.speed === 'number' &&
+          msg.speed >= 0
         ) {
           broadcastToSession(id, 'receiver_progress', {
             progress: msg.progress,
