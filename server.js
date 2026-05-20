@@ -26,7 +26,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url))
 
 // ─── Config ───────────────────────────────────────────────────────────────────
 const PORT                = parseInt(process.env.PORT || '4000', 10)
-const HOST                = process.env.HOST          || '127.0.0.1'
+const HOST                = process.env.HOST          || '0.0.0.0'
 const MAX_SESSION_TTL     = 24 * 60 * 60 * 1000
 const CLEANUP_INTERVAL    = 5  * 60 * 1000
 const MAX_SESSIONS_PER_IP = 10
