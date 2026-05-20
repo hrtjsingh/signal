@@ -1,6 +1,6 @@
 /**
  * FluxShare — Signaling Server
- * Secure WebSocket + REST signaling server
+ * Fully fixed Fastify + WebSocket server
  */
 
 import Fastify from 'fastify'
@@ -26,17 +26,17 @@ const HOST = process.env.HOST || '0.0.0.0'
 const MAX_SESSION_TTL = 24 * 60 * 60 * 1000
 const CLEANUP_INTERVAL = 5 * 60 * 1000
 
-const MAX_SESSIONS_TOTAL = 100_000
-const MAX_WS_PER_SESSION = 8
+const MAX_SESSIONS_TOTAL = 100000
 const MAX_WS_GLOBAL = 2000
+const MAX_WS_PER_SESSION = 8
 
 // ─────────────────────────────────────────────────────────────
-// Token secret
+// Token Secret
 // ─────────────────────────────────────────────────────────────
 
 const TOKEN_SECRET_FILE = path.join(
-  process.env.DATA_DIR || '/tmp',
-  'fluxshare-token.secret'
+  process.env.DATA_DIR || './data',
+  'token.secret'
 )
 
 function loadOrCreateTokenSecret() {
@@ -70,10 +70,7 @@ const TOKEN_SECRET = loadOrCreateTokenSecret()
 // ─────────────────────────────────────────────────────────────
 
 const app = Fastify({
-  logger: {
-    level: process.env.LOG_LEVEL || 'info',
-  },
-  trustProxy: true,
+  logger: true,
 })
 
 // ─────────────────────────────────────────────────────────────
@@ -94,59 +91,38 @@ await app.register(rateLimit, {
   timeWindow: '1 minute',
 })
 
-await app.register(websocket, {
-  options: {
-    maxPayload: 4 * 1024,
-    perMessageDeflate: false,
-    clientTracking: true,
-  },
-})
+await app.register(websocket)
 
-app.ready(err => {
-  if (err) {
-    app.log.error(err)
-  }
+// ─────────────────────────────────────────────────────────────
+// Store
+// ─────────────────────────────────────────────────────────────
 
-  app.log.info('WebSocket plugin ready')
-})
+const sessions = new Map()
+const subscribers = new Map()
+
+let globalWsCount = 0
 
 // ─────────────────────────────────────────────────────────────
 // Helpers
 // ─────────────────────────────────────────────────────────────
 
-const BTIH_HEX_RE = /^[0-9a-fA-F]{40}$/
-const BTIH_BASE32_RE = /^[A-Z2-7]{32}$/i
+function broadcastToSession(sessionId, event, data) {
+  const subs = subscribers.get(sessionId)
 
-function validateAndSanitiseMagnet(uri) {
-  if (typeof uri !== 'string' || uri.length > 512) {
-    return null
-  }
+  if (!subs?.size) return
 
-  try {
-    const u = new URL(uri)
+  const payload = JSON.stringify({
+    event,
+    data,
+    ts: Date.now(),
+  })
 
-    if (u.protocol !== 'magnet:') {
-      return null
-    }
-
-    const xt = u.searchParams.get('xt')
-
-    if (!xt?.startsWith('urn:btih:')) {
-      return null
-    }
-
-    const hash = xt.slice('urn:btih:'.length)
-
-    if (
-      !BTIH_HEX_RE.test(hash) &&
-      !BTIH_BASE32_RE.test(hash)
-    ) {
-      return null
-    }
-
-    return uri
-  } catch {
-    return null
+  for (const ws of subs) {
+    try {
+      if (ws.readyState === 1) {
+        ws.send(payload)
+      }
+    } catch {}
   }
 }
 
@@ -162,42 +138,21 @@ function issueOwnerToken(sessionId) {
 }
 
 function verifyOwnerToken(sessionId, token) {
-  if (!token || typeof token !== 'string') {
-    return false
-  }
+  if (!token) return false
 
-  const dotIdx = token.lastIndexOf('.')
+  const dot = token.lastIndexOf('.')
 
-  if (dotIdx < 1) {
-    return false
-  }
+  if (dot < 0) return false
 
-  const b64 = token.slice(0, dotIdx)
-  const sigPart = token.slice(dotIdx + 1)
-
-  if (!/^[0-9a-fA-F]{64}$/.test(sigPart)) {
-    return false
-  }
+  const b64 = token.slice(0, dot)
+  const sig = token.slice(dot + 1)
 
   try {
     const payload = Buffer.from(b64, 'base64').toString()
 
-    const [sid, tsStr] = payload.split(':')
+    const [sid] = payload.split(':')
 
-    const ts = parseInt(tsStr, 10)
-
-    if (!sid || sid !== sessionId) {
-      return false
-    }
-
-    if (!Number.isFinite(ts)) {
-      return false
-    }
-
-    if (
-      Date.now() - ts >
-      MAX_SESSION_TTL + 3600000
-    ) {
+    if (sid !== sessionId) {
       return false
     }
 
@@ -207,8 +162,8 @@ function verifyOwnerToken(sessionId, token) {
       .digest('hex')
 
     return crypto.timingSafeEqual(
-      Buffer.from(sigPart, 'hex'),
-      Buffer.from(expected, 'hex')
+      Buffer.from(sig),
+      Buffer.from(expected)
     )
   } catch {
     return false
@@ -216,38 +171,7 @@ function verifyOwnerToken(sessionId, token) {
 }
 
 // ─────────────────────────────────────────────────────────────
-// Store
-// ─────────────────────────────────────────────────────────────
-
-const sessions = new Map()
-const subscribers = new Map()
-
-let globalWsCount = 0
-
-function broadcastToSession(sessionId, event, data) {
-  const subs = subscribers.get(sessionId)
-
-  if (!subs?.size) {
-    return
-  }
-
-  const msg = JSON.stringify({
-    event,
-    data,
-    ts: Date.now(),
-  })
-
-  for (const ws of subs) {
-    try {
-      if (ws.readyState === 1) {
-        ws.send(msg)
-      }
-    } catch {}
-  }
-}
-
-// ─────────────────────────────────────────────────────────────
-// Health
+// Health Routes
 // ─────────────────────────────────────────────────────────────
 
 app.get('/health', async () => {
@@ -258,7 +182,10 @@ app.get('/health', async () => {
   }
 })
 
-app.get('/ws', { websocket: true }, (socket) => {
+// IMPORTANT FIX
+app.get('/ws', { websocket: true }, (connection, req) => {
+  const socket = connection.socket
+
   app.log.info('WS health connected')
 
   socket.send(JSON.stringify({
@@ -269,15 +196,24 @@ app.get('/ws', { websocket: true }, (socket) => {
     },
   }))
 
-  setTimeout(() => {
+  const heartbeat = setInterval(() => {
     try {
-      socket.close(1000, 'OK')
+      socket.ping()
     } catch {}
-  }, 1000)
+  }, 30000)
+
+  socket.on('close', () => {
+    clearInterval(heartbeat)
+    app.log.info('WS health disconnected')
+  })
+
+  socket.on('error', () => {
+    clearInterval(heartbeat)
+  })
 })
 
 // ─────────────────────────────────────────────────────────────
-// Create session
+// Create Session
 // ─────────────────────────────────────────────────────────────
 
 app.post('/api/sessions', async (req, reply) => {
@@ -286,22 +222,11 @@ app.post('/api/sessions', async (req, reply) => {
     magnetURI,
     files,
     totalSize,
-    expiresAt,
-  } = req.body || {}
+  } = req.body
 
-  if (
-    !id ||
-    typeof id !== 'string' ||
-    !/^[a-zA-Z0-9]{6,16}$/.test(id)
-  ) {
+  if (!id || !magnetURI) {
     return reply.status(400).send({
-      error: 'Invalid session id',
-    })
-  }
-
-  if (!validateAndSanitiseMagnet(magnetURI)) {
-    return reply.status(400).send({
-      error: 'Invalid magnet URI',
+      error: 'Missing fields',
     })
   }
 
@@ -317,36 +242,29 @@ app.post('/api/sessions', async (req, reply) => {
     })
   }
 
-  const now = Date.now()
-
   const session = {
     id,
     magnetURI,
-    files: Array.isArray(files) ? files : [],
-    totalSize: Number(totalSize) || 0,
-    createdAt: now,
-    expiresAt: Math.min(
-      expiresAt || now + MAX_SESSION_TTL,
-      now + MAX_SESSION_TTL
-    ),
+    files,
+    totalSize,
     status: 'active',
+    createdAt: Date.now(),
+    expiresAt: Date.now() + MAX_SESSION_TTL,
   }
 
   sessions.set(id, session)
-
-  const ownerToken = issueOwnerToken(id)
 
   app.log.info(`Session created ${id}`)
 
   return reply.status(201).send({
     id,
+    ownerToken: issueOwnerToken(id),
     expiresAt: session.expiresAt,
-    ownerToken,
   })
 })
 
 // ─────────────────────────────────────────────────────────────
-// Get session
+// Get Session
 // ─────────────────────────────────────────────────────────────
 
 app.get('/api/sessions/:id', async (req, reply) => {
@@ -354,7 +272,7 @@ app.get('/api/sessions/:id', async (req, reply) => {
 
   if (!session) {
     return reply.status(404).send({
-      error: 'Transfer not found',
+      error: 'Session not found',
     })
   }
 
@@ -362,7 +280,7 @@ app.get('/api/sessions/:id', async (req, reply) => {
 })
 
 // ─────────────────────────────────────────────────────────────
-// Delete session
+// Delete Session
 // ─────────────────────────────────────────────────────────────
 
 app.delete('/api/sessions/:id', async (req, reply) => {
@@ -390,25 +308,15 @@ app.delete('/api/sessions/:id', async (req, reply) => {
 app.get(
   '/ws/sessions/:id',
   { websocket: true },
-  (socket, req) => {
+  (connection, req) => {
+
+    const socket = connection.socket
     const { id } = req.params
 
-    app.log.info(`WS session connect ${id}`)
+    app.log.info(`WS connected ${id}`)
 
     if (globalWsCount >= MAX_WS_GLOBAL) {
-      socket.send(JSON.stringify({
-        event: 'error',
-        data: {
-          message: 'Server at capacity',
-        },
-      }))
-
-      socket.close(1013, 'Server at capacity')
-      return
-    }
-
-    if (!/^[a-zA-Z0-9]{6,16}$/.test(id)) {
-      socket.close(1008, 'Invalid session ID')
+      socket.close(1013)
       return
     }
 
@@ -422,7 +330,7 @@ app.get(
         },
       }))
 
-      socket.close(1008, 'Session not found')
+      socket.close(1008)
       return
     }
 
@@ -433,14 +341,7 @@ app.get(
     const subs = subscribers.get(id)
 
     if (subs.size >= MAX_WS_PER_SESSION) {
-      socket.send(JSON.stringify({
-        event: 'error',
-        data: {
-          message: 'Too many connections',
-        },
-      }))
-
-      socket.close(1008, 'Subscriber cap reached')
+      socket.close(1008)
       return
     }
 
@@ -454,23 +355,18 @@ app.get(
         status: session.status,
         expiresAt: session.expiresAt,
       },
-      ts: Date.now(),
     }))
 
     const heartbeat = setInterval(() => {
       try {
-        if (socket.readyState === 1) {
-          socket.ping()
-        }
+        socket.ping()
       } catch {}
     }, 30000)
 
     let cleaned = false
 
     const cleanup = () => {
-      if (cleaned) {
-        return
-      }
+      if (cleaned) return
 
       cleaned = true
 
@@ -492,24 +388,19 @@ app.get(
 
     socket.on('message', raw => {
       try {
-        if (raw.length > 512) {
-          return
-        }
-
         const msg = JSON.parse(raw.toString())
 
         if (
-          msg.event === 'progress' &&
-          typeof msg.progress === 'number' &&
-          msg.progress >= 0 &&
-          msg.progress <= 100 &&
-          typeof msg.speed === 'number' &&
-          msg.speed >= 0
+          msg.event === 'progress'
         ) {
-          broadcastToSession(id, 'receiver_progress', {
-            progress: msg.progress,
-            speed: msg.speed,
-          })
+          broadcastToSession(
+            id,
+            'receiver_progress',
+            {
+              progress: msg.progress,
+              speed: msg.speed,
+            }
+          )
         }
       } catch {}
     })
@@ -526,24 +417,16 @@ app.get(
 setInterval(() => {
   const now = Date.now()
 
-  let cleaned = 0
-
   for (const [id, session] of sessions) {
-    if (
-      session.expiresAt < now ||
-      session.status !== 'active'
-    ) {
+    if (session.expiresAt < now) {
+
       broadcastToSession(id, 'expired', {})
 
       sessions.delete(id)
       subscribers.delete(id)
 
-      cleaned++
+      app.log.info(`Session expired ${id}`)
     }
-  }
-
-  if (cleaned > 0) {
-    app.log.info(`Cleaned ${cleaned} sessions`)
   }
 }, CLEANUP_INTERVAL)
 
@@ -558,7 +441,7 @@ try {
   })
 
   app.log.info(
-    `FluxShare signaling server running on ${HOST}:${PORT}`
+    `FluxShare server running on ${HOST}:${PORT}`
   )
 } catch (err) {
   app.log.error(err)
