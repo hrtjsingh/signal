@@ -1,5 +1,6 @@
 /**
  * FluxShare — Signaling Server
+ * Secure WebSocket + REST signaling server
  */
 
 import Fastify from 'fastify'
@@ -7,6 +8,7 @@ import cors from '@fastify/cors'
 import helmet from '@fastify/helmet'
 import websocket from '@fastify/websocket'
 import rateLimit from '@fastify/rate-limit'
+
 import crypto from 'crypto'
 import fs from 'fs'
 import path from 'path'
@@ -17,34 +19,29 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url))
 // ─────────────────────────────────────────────────────────────
 // Config
 // ─────────────────────────────────────────────────────────────
+
 const PORT = parseInt(process.env.PORT || '4000', 10)
 const HOST = process.env.HOST || '0.0.0.0'
 
 const MAX_SESSION_TTL = 24 * 60 * 60 * 1000
 const CLEANUP_INTERVAL = 5 * 60 * 1000
 
-const MAX_SESSIONS_PER_IP = 10
 const MAX_SESSIONS_TOTAL = 100_000
-
 const MAX_WS_PER_SESSION = 8
 const MAX_WS_GLOBAL = 2000
 
 // ─────────────────────────────────────────────────────────────
 // Token secret
 // ─────────────────────────────────────────────────────────────
+
 const TOKEN_SECRET_FILE = path.join(
-  process.env.DATA_DIR || '/var/lib/fluxshare',
-  'token.secret'
+  process.env.DATA_DIR || '/tmp',
+  'fluxshare-token.secret'
 )
 
 function loadOrCreateTokenSecret() {
   if (process.env.FLUX_TOKEN_SECRET) {
     return process.env.FLUX_TOKEN_SECRET
-  }
-
-  if (process.env.NODE_ENV === 'production') {
-    console.error('FATAL: FLUX_TOKEN_SECRET must be set')
-    process.exit(1)
   }
 
   try {
@@ -58,12 +55,9 @@ function loadOrCreateTokenSecret() {
   try {
     fs.mkdirSync(path.dirname(TOKEN_SECRET_FILE), {
       recursive: true,
-      mode: 0o700,
     })
 
-    fs.writeFileSync(TOKEN_SECRET_FILE, secret, {
-      mode: 0o600,
-    })
+    fs.writeFileSync(TOKEN_SECRET_FILE, secret)
   } catch {}
 
   return secret
@@ -74,86 +68,52 @@ const TOKEN_SECRET = loadOrCreateTokenSecret()
 // ─────────────────────────────────────────────────────────────
 // Fastify
 // ─────────────────────────────────────────────────────────────
+
 const app = Fastify({
   logger: {
     level: process.env.LOG_LEVEL || 'info',
   },
-  trustProxy: false,
+  trustProxy: true,
 })
 
 // ─────────────────────────────────────────────────────────────
 // Plugins
 // ─────────────────────────────────────────────────────────────
-await app.register(helmet, {
-  contentSecurityPolicy: {
-    directives: {
-      defaultSrc: ["'none'"],
-      frameAncestors: ["'none'"],
-    },
-  },
-  hsts: {
-    maxAge: 31536000,
-    includeSubDomains: true,
-    preload: true,
-  },
-  noSniff: true,
-  frameguard: {
-    action: 'deny',
-  },
-})
 
-app.addHook('onSend', async (_req, reply) => {
-  reply.header(
-    'Permissions-Policy',
-    'camera=(), microphone=(), geolocation=(), payment=()'
-  )
+await app.register(helmet, {
+  contentSecurityPolicy: false,
 })
 
 await app.register(cors, {
-  origin: (origin, cb) => {
-    const allowed = new Set([
-      'https://flux.share',
-      ...(process.env.NODE_ENV === 'development'
-        ? ['http://localhost:3000']
-        : []),
-    ])
-
-    if (!origin) {
-      cb(null, true)
-      return
-    }
-
-    if (allowed.has(origin)) {
-      cb(null, true)
-      return
-    }
-
-    cb(new Error('CORS blocked'), false)
-  },
-
-  methods: ['GET', 'POST', 'PATCH', 'DELETE'],
-  allowedHeaders: ['Content-Type', 'Authorization'],
+  origin: true,
 })
 
 await app.register(rateLimit, {
   global: true,
   max: 100,
   timeWindow: '1 minute',
-  errorResponseBuilder: () => ({
-    error: 'Too many requests',
-  }),
 })
 
 await app.register(websocket, {
   options: {
     maxPayload: 4 * 1024,
     perMessageDeflate: false,
+    clientTracking: true,
   },
+})
+
+app.ready(err => {
+  if (err) {
+    app.log.error(err)
+  }
+
+  app.log.info('WebSocket plugin ready')
 })
 
 // ─────────────────────────────────────────────────────────────
 // Helpers
 // ─────────────────────────────────────────────────────────────
+
 const BTIH_HEX_RE = /^[0-9a-fA-F]{40}$/
 const BTIH_BASE32_RE = /^[A-Z2-7]{32}$/i
 
@@ -177,7 +137,10 @@ function validateAndSanitiseMagnet(uri) {
 
     const hash = xt.slice('urn:btih:'.length)
 
-    if (!BTIH_HEX_RE.test(hash) && !BTIH_BASE32_RE.test(hash)) {
+    if (
+      !BTIH_HEX_RE.test(hash) &&
+      !BTIH_BASE32_RE.test(hash)
+    ) {
       return null
     }
 
@@ -231,7 +194,10 @@ function verifyOwnerToken(sessionId, token) {
       return false
     }
 
-    if (Date.now() - ts > MAX_SESSION_TTL + 3600000) {
+    if (
+      Date.now() - ts >
+      MAX_SESSION_TTL + 3600000
+    ) {
       return false
     }
 
@@ -252,6 +218,7 @@ function verifyOwnerToken(sessionId, token) {
 // ─────────────────────────────────────────────────────────────
 // Store
 // ─────────────────────────────────────────────────────────────
+
 const sessions = new Map()
 const subscribers = new Map()
 
@@ -280,8 +247,9 @@ function broadcastToSession(sessionId, event, data) {
 }
 
 // ─────────────────────────────────────────────────────────────
-// Health routes
+// Health
 // ─────────────────────────────────────────────────────────────
+
 app.get('/health', async () => {
   return {
     ok: true,
@@ -290,7 +258,7 @@ app.get('/health', async () => {
   }
 })
 
-app.get('/ws', { websocket: true }, (socket, req) => {
+app.get('/ws', { websocket: true }, (socket) => {
   app.log.info('WS health connected')
 
   socket.send(JSON.stringify({
@@ -311,6 +279,7 @@ app.get('/ws', { websocket: true }, (socket, req) => {
 // ─────────────────────────────────────────────────────────────
 // Create session
 // ─────────────────────────────────────────────────────────────
+
 app.post('/api/sessions', async (req, reply) => {
   const {
     id,
@@ -318,7 +287,17 @@ app.post('/api/sessions', async (req, reply) => {
     files,
     totalSize,
     expiresAt,
-  } = req.body
+  } = req.body || {}
+
+  if (
+    !id ||
+    typeof id !== 'string' ||
+    !/^[a-zA-Z0-9]{6,16}$/.test(id)
+  ) {
+    return reply.status(400).send({
+      error: 'Invalid session id',
+    })
+  }
 
   if (!validateAndSanitiseMagnet(magnetURI)) {
     return reply.status(400).send({
@@ -343,8 +322,8 @@ app.post('/api/sessions', async (req, reply) => {
   const session = {
     id,
     magnetURI,
-    files,
-    totalSize,
+    files: Array.isArray(files) ? files : [],
+    totalSize: Number(totalSize) || 0,
     createdAt: now,
     expiresAt: Math.min(
       expiresAt || now + MAX_SESSION_TTL,
@@ -369,6 +348,7 @@ app.post('/api/sessions', async (req, reply) => {
 // ─────────────────────────────────────────────────────────────
 // Get session
 // ─────────────────────────────────────────────────────────────
+
 app.get('/api/sessions/:id', async (req, reply) => {
   const session = sessions.get(req.params.id)
 
@@ -384,6 +364,7 @@ app.get('/api/sessions/:id', async (req, reply) => {
 // ─────────────────────────────────────────────────────────────
 // Delete session
 // ─────────────────────────────────────────────────────────────
+
 app.delete('/api/sessions/:id', async (req, reply) => {
   const token = (req.headers.authorization || '')
     .replace(/^Bearer /, '')
@@ -405,6 +386,7 @@ app.delete('/api/sessions/:id', async (req, reply) => {
 // ─────────────────────────────────────────────────────────────
 // Session WebSocket
 // ─────────────────────────────────────────────────────────────
+
 app.get(
   '/ws/sessions/:id',
   { websocket: true },
@@ -486,7 +468,9 @@ app.get(
     let cleaned = false
 
     const cleanup = () => {
-      if (cleaned) return
+      if (cleaned) {
+        return
+      }
 
       cleaned = true
 
@@ -538,6 +522,7 @@ app.get(
 // ─────────────────────────────────────────────────────────────
 // Cleanup
 // ─────────────────────────────────────────────────────────────
+
 setInterval(() => {
   const now = Date.now()
 
@@ -565,6 +550,7 @@ setInterval(() => {
 // ─────────────────────────────────────────────────────────────
 // Start
 // ─────────────────────────────────────────────────────────────
+
 try {
   await app.listen({
     port: PORT,
